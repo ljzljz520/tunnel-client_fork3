@@ -419,9 +419,15 @@ type MCPConfig struct {
 	MaxConcurrentRequests int
 	ExtraHeaders          map[string]string
 	DiscoveryExtraHeaders map[string]string
-	OAuthTrustedOrigins   []*url.URL
-	HTTPProxy             *url.URL
-	HTTPProxySource       ProxySource
+	// ExtraHeaderReferences and DiscoveryExtraHeaderReferences preserve the
+	// raw operator spelling (literal, env:, file:) of the header maps above
+	// so optional credential hot rotation can re-read file: references.
+	ExtraHeaderReferences          map[string]string
+	DiscoveryExtraHeaderReferences map[string]string
+	CredentialRotation             CredentialRotationConfig
+	OAuthTrustedOrigins            []*url.URL
+	HTTPProxy                      *url.URL
+	HTTPProxySource                ProxySource
 }
 
 // PollTimeoutOrDefault returns the configured requested service wait or its runtime default.
@@ -695,6 +701,7 @@ func RegisterFlags(fs *pflag.FlagSet, flavor Flavor) {
 	fs.StringArray("mcp.extra-headers", nil, "Static HTTP headers to send to the configured MCP server origin (format 'Key: Value', repeatable; values accept env:VAR or file:/path) (env.MCP_EXTRA_HEADERS)")
 	fs.StringArray("mcp.discovery-extra-headers", nil, "Static HTTP headers to send to MCP discovery/probe requests for the configured MCP server origin (format 'Key: Value', repeatable; values accept env:VAR or file:/path) (env.MCP_DISCOVERY_EXTRA_HEADERS)")
 	fs.StringArray("mcp.oauth-trusted-origin", nil, "Additional HTTP(S) origin trusted for OAuth discovery (repeatable; origin only, without a path) (env.MCP_OAUTH_TRUSTED_ORIGINS)")
+	registerCredentialRotationFlags(fs)
 	fs.Duration("mcp.startup-wait-timeout", 0, "Maximum opt-in startup wait for the main MCP HTTP listener before first poll (env.MCP_STARTUP_WAIT_TIMEOUT)")
 	fs.Duration("mcp.connection-max-ttl", defaultMCPConnectionMaxTTL, "Maximum lifetime of MCP transport connections (env.MCP_CONNECTION_MAX_TTL)")
 	fs.Int("mcp.max-concurrent-requests", defaultMCPMaxConcurrentRequests, "Maximum number of requests actively dispatched to the MCP server (env.MCP_MAX_CONCURRENT_REQUESTS)")
@@ -2131,11 +2138,15 @@ func buildMCPConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, bool), gl
 	if err != nil {
 		return MCPConfig{}, err
 	}
-	extraHeaders, err := buildExtraHeaders(fs, lookupEnv, "mcp.extra-headers", "MCP_EXTRA_HEADERS")
+	extraHeaders, extraHeaderReferences, err := buildExtraHeaderSets(fs, lookupEnv, "mcp.extra-headers", "MCP_EXTRA_HEADERS")
 	if err != nil {
 		return MCPConfig{}, err
 	}
-	discoveryExtraHeaders, err := buildExtraHeaders(fs, lookupEnv, "mcp.discovery-extra-headers", "MCP_DISCOVERY_EXTRA_HEADERS")
+	discoveryExtraHeaders, discoveryHeaderReferences, err := buildExtraHeaderSets(fs, lookupEnv, "mcp.discovery-extra-headers", "MCP_DISCOVERY_EXTRA_HEADERS")
+	if err != nil {
+		return MCPConfig{}, err
+	}
+	credentialRotation, err := buildCredentialRotationConfig(fs, lookupEnv)
 	if err != nil {
 		return MCPConfig{}, err
 	}
@@ -2194,9 +2205,15 @@ func buildMCPConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, bool), gl
 		MaxConcurrentRequests:            maxConcurrent,
 		ExtraHeaders:                     extraHeaders,
 		DiscoveryExtraHeaders:            discoveryExtraHeaders,
+		ExtraHeaderReferences:            extraHeaderReferences,
+		DiscoveryExtraHeaderReferences:   discoveryHeaderReferences,
+		CredentialRotation:               credentialRotation,
 		OAuthTrustedOrigins:              oauthTrustedOrigins,
 		HTTPProxy:                        mcpProxy,
 		HTTPProxySource:                  mcpProxySource,
+	}
+	if err := cfg.validateCredentialRotation(); err != nil {
+		return MCPConfig{}, err
 	}
 	if mainBinding := cfg.MainChannelBinding(); mainBinding != nil {
 		cfg.ServerURL = mainBinding.ServerURL

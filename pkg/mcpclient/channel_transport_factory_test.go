@@ -1049,44 +1049,23 @@ func generateSignedLeaf(t *testing.T, caCert *x509.Certificate, caKey *rsa.Priva
 
 func generateSignedClientCertificate(t *testing.T, caCert *x509.Certificate, caKey *rsa.PrivateKey) (tls.Certificate, string, string) {
 	t.Helper()
+	return writeSignedClientCertificate(t, caCert, caKey, 13, "client")
+}
 
-	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("generate client key: %v", err)
-	}
-	clientTemplate := &x509.Certificate{
-		SerialNumber: big.NewInt(13),
-		Subject:      pkix.Name{CommonName: "test-client"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(2 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	}
-	clientDER, err := x509.CreateCertificate(rand.Reader, clientTemplate, caCert, &clientKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatalf("create client certificate: %v", err)
-	}
-	clientPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientDER})
-	if clientPEM == nil {
-		t.Fatalf("encode client certificate PEM")
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey)})
-	if keyPEM == nil {
-		t.Fatalf("encode client key PEM")
-	}
-	clientPair, err := tls.X509KeyPair(clientPEM, keyPEM)
+// writeSignedClientCertificate mints a client certificate with the given
+// serial number and writes its PEM material under a fresh temp directory.
+func writeSignedClientCertificate(t *testing.T, caCert *x509.Certificate, caKey *rsa.PrivateKey, serial int64, name string) (tls.Certificate, string, string) {
+	t.Helper()
+	certPEM, keyPEM := mintClientCertificatePEM(t, caCert, caKey, serial)
+	clientPair, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("load client key pair: %v", err)
 	}
 	dir := t.TempDir()
-	clientCertPath := filepath.Join(dir, "client.crt")
-	clientKeyPath := filepath.Join(dir, "client.key")
-	if err := os.WriteFile(clientCertPath, clientPEM, 0o600); err != nil {
-		t.Fatalf("write client cert: %v", err)
-	}
-	if err := os.WriteFile(clientKeyPath, keyPEM, 0o600); err != nil {
-		t.Fatalf("write client key: %v", err)
-	}
+	clientCertPath := filepath.Join(dir, name+".crt")
+	clientKeyPath := filepath.Join(dir, name+".key")
+	writeRotationFile(t, clientCertPath, certPEM)
+	writeRotationFile(t, clientKeyPath, keyPEM)
 	return clientPair, clientCertPath, clientKeyPath
 }
 

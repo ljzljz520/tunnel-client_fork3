@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/openai/tunnel-client/pkg/credrotation"
 	"github.com/openai/tunnel-client/pkg/headerscope"
 	"github.com/openai/tunnel-client/pkg/healthstate"
 	tclog "github.com/openai/tunnel-client/pkg/log"
@@ -529,59 +530,105 @@ func (w slogWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func buildMcpHTTPTransport(logger *slog.Logger, loggingCfg *runtimeconfig.LoggingConfig, meterProvider *sdkmetric.MeterProvider, tlsBundle *tlsconfig.Bundle, clientCertificate *tlsconfig.ClientCertificate, unixSocketPath string, proxyURL *url.URL, serverURL *url.URL, extraHeaders map[string]string, discoveryExtraHeaders map[string]string, localTracing bool) (http.RoundTripper, error) {
+// mcpHTTPTransportParams configures the per-channel MCP HTTP transport stack.
+type mcpHTTPTransportParams struct {
+	Logger                *slog.Logger
+	LoggingConfig         *runtimeconfig.LoggingConfig
+	MeterProvider         *sdkmetric.MeterProvider
+	TLSBundle             *tlsconfig.Bundle
+	ClientCertificate     *tlsconfig.ClientCertificate
+	UnixSocketPath        string
+	ProxyURL              *url.URL
+	ServerURL             *url.URL
+	ExtraHeaders          map[string]string
+	DiscoveryExtraHeaders map[string]string
+	LocalTracing          bool
+	// RotationManager is set for channels with credential hot rotation. When
+	// non-nil the static client certificate and static header maps are not
+	// installed; every request derives both from the manager's current
+	// generation.
+	RotationManager *credrotation.Manager
+}
+
+func buildMcpHTTPTransport(params mcpHTTPTransportParams) (http.RoundTripper, *credentialRotator, error) {
+	logger := params.Logger
 	// Order matters (outermost to innermost):
 	//   1. Static headers apply operator headers to the configured MCP origin.
 	//   2. Forwarding injects per-request connector headers last so they win conflicts.
 	//   3. Logging wraps otel instrumentation so raw dumps include final headers.
 	//   4. otelhttp instrumentation and its route labeler sit close to the network to record final calls.
-	extraHeaders, err := runtimeconfig.NormalizeExtraHeaders("MCP extra headers", extraHeaders)
-	if err != nil {
-		return nil, fmt.Errorf("mcpclient: %w", err)
-	}
-	discoveryExtraHeaders, err = runtimeconfig.NormalizeExtraHeaders("MCP discovery extra headers", discoveryExtraHeaders)
-	if err != nil {
-		return nil, fmt.Errorf("mcpclient: %w", err)
-	}
-	base, err := tctransport.CloneDefaultWithBundle(tlsBundle)
-	if err != nil {
-		return nil, fmt.Errorf("mcpclient: %w", err)
-	}
-	base, err = tctransport.ApplyProxy(base, proxyURL)
-	if err != nil {
-		return nil, fmt.Errorf("mcpclient: %w", err)
-	}
-	base, err = tctransport.ApplyUnixSocketPath(base, unixSocketPath)
-	if err != nil {
-		return nil, fmt.Errorf("mcpclient: %w", err)
-	}
-	if clientCertificate != nil {
-		mtlsBase, err := tctransport.ApplyClientCertificate(base, clientCertificate)
+	var (
+		extraHeaders          map[string]string
+		discoveryExtraHeaders map[string]string
+		err                   error
+	)
+	if params.RotationManager == nil {
+		extraHeaders, err = runtimeconfig.NormalizeExtraHeaders("MCP extra headers", params.ExtraHeaders)
 		if err != nil {
-			return nil, fmt.Errorf("mcpclient: %w", err)
+			return nil, nil, fmt.Errorf("mcpclient: %w", err)
 		}
-		base = &originScopedRoundTripper{
-			serverURL:                serverURL,
+		discoveryExtraHeaders, err = runtimeconfig.NormalizeExtraHeaders("MCP discovery extra headers", params.DiscoveryExtraHeaders)
+		if err != nil {
+			return nil, nil, fmt.Errorf("mcpclient: %w", err)
+		}
+	}
+	base, err := tctransport.CloneDefaultWithBundle(params.TLSBundle)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mcpclient: %w", err)
+	}
+	base, err = tctransport.ApplyProxy(base, params.ProxyURL)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mcpclient: %w", err)
+	}
+	base, err = tctransport.ApplyUnixSocketPath(base, params.UnixSocketPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("mcpclient: %w", err)
+	}
+
+	var (
+		rotator *credentialRotator
+		inner   http.RoundTripper = base
+	)
+	switch {
+	case params.RotationManager != nil:
+		baseTransport, ok := base.(*http.Transport)
+		if !ok {
+			return nil, nil, fmt.Errorf("mcpclient: credential rotation requires a standard HTTP transport, got %T", base)
+		}
+		rotator = newCredentialRotator(logger, params.RotationManager, baseTransport, params.ServerURL)
+		inner = &credentialTransportSelector{rotator: rotator}
+	case params.ClientCertificate != nil:
+		mtlsBase, err := tctransport.ApplyClientCertificate(base, params.ClientCertificate)
+		if err != nil {
+			return nil, nil, fmt.Errorf("mcpclient: %w", err)
+		}
+		inner = &originScopedRoundTripper{
+			serverURL:                params.ServerURL,
 			withClientCertificate:    mtlsBase,
 			withoutClientCertificate: base,
 		}
 	}
-	base = tcmetrics.WithHTTPClientMetricAttributes(base)
-	options := []otelhttp.Option{otelhttp.WithMeterProvider(meterProvider)}
-	if localTracing {
+	wrapped := tcmetrics.WithHTTPClientMetricAttributes(inner)
+	options := []otelhttp.Option{otelhttp.WithMeterProvider(params.MeterProvider)}
+	if params.LocalTracing {
 		options = append(options,
 			otelhttp.WithTracerProvider(noop.NewTracerProvider()),
 			otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()),
 		)
 	}
-	base = otelhttp.NewTransport(base, options...)
+	wrapped = otelhttp.NewTransport(wrapped, options...)
 	forwardingLogger := logger.With(
 		slog.String(tclog.FieldComponent, tclog.ComponentMcpClient),
 		slog.String("transport", "forwarding_rt"),
 	)
-	base = tclog.NewRoundTripper(base, forwardingLogger, loggingCfg, tclog.ComponentMcpClient)
-	base = internal.NewForwardingRoundTripper(base, serverURL)
-	return internal.NewStaticHeadersRoundTripper(base, serverURL, extraHeaders, discoveryExtraHeaders), nil
+	wrapped = tclog.NewRoundTripper(wrapped, forwardingLogger, params.LoggingConfig, tclog.ComponentMcpClient)
+	wrapped = internal.NewForwardingRoundTripper(wrapped, params.ServerURL)
+	if params.RotationManager != nil {
+		wrapped = internal.NewDynamicCredentialRoundTripper(wrapped, params.ServerURL, params.RotationManager.Current)
+	} else {
+		wrapped = internal.NewStaticHeadersRoundTripper(wrapped, params.ServerURL, extraHeaders, discoveryExtraHeaders)
+	}
+	return wrapped, rotator, nil
 }
 
 // originScopedRoundTripper keeps an MCP client certificate scoped to the

@@ -226,6 +226,11 @@ mcp:
     X-Internal-Auth: env:MCP_RUNTIME_HEADER_VALUE
   discovery_extra_headers:
     X-Discovery-Auth: file:/run/secrets/mcp-discovery-header
+  # Optional. Hot-reload file-backed MCP credentials (client cert/key and
+  # file: auth headers) as atomically validated generations.
+  credential_rotation:
+    enabled: true
+    poll_interval: 30s
   # Optional. Explicitly trust separate OAuth metadata/authorization origins.
   oauth_trusted_origins:
     - https://auth.example.com
@@ -754,6 +759,46 @@ routing, streaming, OAuth discovery, and common setup pitfalls, see
   - Conflict behavior: these discovery/probe headers override
     `MCP_EXTRA_HEADERS` for discovery/probe requests. If connector-forwarded
     headers are present on a request, they are still applied last.
+- **File credential hot rotation (optional)**
+  - Enable flag: `--mcp.credential-rotation`
+  - Enable env: `MCP_CREDENTIAL_ROTATION=true`
+  - YAML: `mcp.credential_rotation.enabled: true`
+  - Poll interval flag/env/YAML: `--mcp.credential-rotation-interval=30s`,
+    `MCP_CREDENTIAL_ROTATION_INTERVAL=30s`,
+    `mcp.credential_rotation.poll_interval: 30s`. Values below `1s` are
+    rejected; the default is `30s`.
+  - Watched credentials: every `http-streamable` channel's
+    `client-cert`/`client-key` pair plus every `file:` reference used by
+    `--mcp.extra-headers` and `--mcp.discovery-extra-headers`. `env:` and
+    literal header values are re-resolved as part of each reload. Enabling
+    rotation requires at least one file-backed credential on an
+    `http-streamable` binding; otherwise startup is rejected. stdio channels
+    are not rotated.
+  - Atomic generations: on each poll, the certificate, private key, and both
+    header sets for a channel are re-read and validated together. Requests
+    always observe one complete generation; a new certificate can never be
+    sent with an old key or headers from a different generation.
+  - Staged updates: write the new files independently (e.g. certificate, then
+    key, then header file) within one poll interval, or replace them
+    atomically with `rename(2)`. An intermediate or otherwise invalid set
+    fails the generation validation as a whole; the last validated generation
+    keeps serving until a complete valid set appears.
+  - Switch semantics: after a validated switch, new MCP requests and OAuth
+    discovery/probe traffic use the new identity. In-flight requests are not
+    cancelled or retried and finish on the generation they started with;
+    their connections are closed when the response completes. Each generation
+    keeps its own connection pool, so new requests re-handshake TLS with the
+    new certificate and cannot reuse a previous generation's authenticated
+    connection.
+  - Fail-closed startup: if the initial credential generation cannot be read
+    or validated, the client fails at startup rather than serving without
+    credentials.
+  - Channel isolation: each `http-streamable` channel has its own watcher,
+    generation counter, and connection pool. Rotating one channel never
+    changes another channel's credentials or connections.
+  - Diagnostics: rotation logs carry the channel, generation number, and a
+    short non-reversible certificate fingerprint only. Secret values and
+    certificate/key contents are never logged.
 
 **OAuth-protected MCP notes:**
 

@@ -305,18 +305,15 @@ func TestBuildMcpHTTPTransportRejectsInvalidExtraHeaders(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := buildMcpHTTPTransport(
-				slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
-				&config.LoggingConfig{},
-				sdkmetric.NewMeterProvider(),
-				nil,
-				nil,
-				"",
-				nil,
-				mustParseURL(t, "https://example.invalid/mcp"),
-				tc.extraHeaders,
-				tc.discoveryHeaders,
-				false,
+			_, _, err := buildMcpHTTPTransport(
+				mcpHTTPTransportParams{
+					Logger:                slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+					LoggingConfig:         &config.LoggingConfig{},
+					MeterProvider:         sdkmetric.NewMeterProvider(),
+					ServerURL:             mustParseURL(t, "https://example.invalid/mcp"),
+					ExtraHeaders:          tc.extraHeaders,
+					DiscoveryExtraHeaders: tc.discoveryHeaders,
+				},
 			)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("expected %q error, got %v", tc.wantErr, err)

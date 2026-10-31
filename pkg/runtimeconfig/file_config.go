@@ -101,20 +101,26 @@ type fileCloudflaredConfig struct {
 }
 
 type fileMCPConfig struct {
-	ServerURLs                       []fileMCPServerURL `yaml:"server_urls"`
-	Commands                         []fileMCPCommand   `yaml:"commands"`
-	HTTPProxy                        *string            `yaml:"http_proxy"`
-	ClientCert                       *string            `yaml:"client_cert"`
-	ClientKey                        *string            `yaml:"client_key"`
-	ExtraHeaders                     map[string]string  `yaml:"extra_headers"`
-	DiscoveryExtraHeaders            map[string]string  `yaml:"discovery_extra_headers"`
-	OAuthTrustedOrigins              []string           `yaml:"oauth_trusted_origins"`
-	StartupWaitTimeout               *string            `yaml:"startup_wait_timeout"`
-	StdioFailurePolicy               *string            `yaml:"stdio_failure_policy"`
-	StdioSendInitializedNotification *bool              `yaml:"stdio_send_initialized_notification"`
-	ForwardTraceContext              *bool              `yaml:"forward_trace_context"`
-	ConnectionMaxTTL                 *string            `yaml:"connection_max_ttl"`
-	MaxConcurrentRequests            *int               `yaml:"max_concurrent_requests"`
+	ServerURLs                       []fileMCPServerURL            `yaml:"server_urls"`
+	Commands                         []fileMCPCommand              `yaml:"commands"`
+	HTTPProxy                        *string                       `yaml:"http_proxy"`
+	ClientCert                       *string                       `yaml:"client_cert"`
+	ClientKey                        *string                       `yaml:"client_key"`
+	ExtraHeaders                     map[string]string             `yaml:"extra_headers"`
+	DiscoveryExtraHeaders            map[string]string             `yaml:"discovery_extra_headers"`
+	OAuthTrustedOrigins              []string                      `yaml:"oauth_trusted_origins"`
+	StartupWaitTimeout               *string                       `yaml:"startup_wait_timeout"`
+	StdioFailurePolicy               *string                       `yaml:"stdio_failure_policy"`
+	StdioSendInitializedNotification *bool                         `yaml:"stdio_send_initialized_notification"`
+	ForwardTraceContext              *bool                         `yaml:"forward_trace_context"`
+	ConnectionMaxTTL                 *string                       `yaml:"connection_max_ttl"`
+	MaxConcurrentRequests            *int                          `yaml:"max_concurrent_requests"`
+	CredentialRotation               *fileCredentialRotationConfig `yaml:"credential_rotation"`
+}
+
+type fileCredentialRotationConfig struct {
+	Enabled      *bool   `yaml:"enabled"`
+	PollInterval *string `yaml:"poll_interval"`
 }
 
 type fileMCPServerURL struct {
@@ -444,6 +450,10 @@ func (c fileConfig) toEnv(lookupEnv func(string) (string, bool)) (map[string]str
 	setBool(env, "MCP_FORWARD_TRACE_CONTEXT", c.MCP.ForwardTraceContext)
 	setString(env, "MCP_CONNECTION_MAX_TTL", c.MCP.ConnectionMaxTTL)
 	setInt(env, "MCP_MAX_CONCURRENT_REQUESTS", c.MCP.MaxConcurrentRequests)
+	if c.MCP.CredentialRotation != nil {
+		setBool(env, "MCP_CREDENTIAL_ROTATION", c.MCP.CredentialRotation.Enabled)
+		setString(env, "MCP_CREDENTIAL_ROTATION_INTERVAL", c.MCP.CredentialRotation.PollInterval)
+	}
 
 	setBool(env, "HARPOON_ALLOW_PLAINTEXT_HTTP", c.Harpoon.AllowPlaintextHTTP)
 	setInt(env, "HARPOON_MAX_RESPONSE_BYTES", c.Harpoon.MaxResponseBytes)

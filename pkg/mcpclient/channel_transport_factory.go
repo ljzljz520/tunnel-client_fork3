@@ -1,6 +1,7 @@
 package mcpclient
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"go.uber.org/fx"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/openai/tunnel-client/pkg/credrotation"
 	tclog "github.com/openai/tunnel-client/pkg/log"
 	"github.com/openai/tunnel-client/pkg/proxy"
 	"github.com/openai/tunnel-client/pkg/runtimeconfig"
@@ -36,9 +38,15 @@ type ChannelTransportFactory struct {
 	meterProvider *sdkmetric.MeterProvider
 	tlsBundle     *tlsconfig.Bundle
 
+	// rotationCtx drives per-channel credential pollers. It is cancelled on
+	// shutdown so all rotation goroutines stop together.
+	rotationCtx    context.Context
+	rotationCancel context.CancelFunc
+
 	mu          sync.Mutex
 	transports  map[string]mcp.Transport
 	httpClients map[string]*http.Client
+	rotators    map[string]*credentialRotator
 
 	transportGroup  singleflight.Group
 	httpClientGroup singleflight.Group
@@ -53,6 +61,7 @@ type channelTransportFactoryParams struct {
 	MeterProvider      *sdkmetric.MeterProvider
 	TLSBundle          *tlsconfig.Bundle
 	TransportProviders []TransportProvider `group:"mcp_transport_providers"`
+	Lifecycle          fx.Lifecycle        `optional:"true"`
 }
 
 var errCrossOriginRuntimeMCPRedirect = errors.New("mcpclient: redirect blocked: destination must use the configured MCP origin")
@@ -61,18 +70,46 @@ func newChannelTransportFactory(p channelTransportFactoryParams) (*ChannelTransp
 	if p.Config == nil || p.Logging == nil || p.Logger == nil || p.MeterProvider == nil {
 		return nil, fmt.Errorf("mcpclient: channel transport factory requires config, logging, logger, and meter provider")
 	}
+	rotationCtx, rotationCancel := context.WithCancel(context.Background())
 	factory := &ChannelTransportFactory{
-		config:        p.Config,
-		logger:        p.Logger,
-		logging:       p.Logging,
-		meterProvider: p.MeterProvider,
-		tlsBundle:     p.TLSBundle,
-		providers:     p.TransportProviders,
-		transports:    make(map[string]mcp.Transport),
-		httpClients:   make(map[string]*http.Client),
+		config:         p.Config,
+		logger:         p.Logger,
+		logging:        p.Logging,
+		meterProvider:  p.MeterProvider,
+		tlsBundle:      p.TLSBundle,
+		providers:      p.TransportProviders,
+		rotationCtx:    rotationCtx,
+		rotationCancel: rotationCancel,
+		transports:     make(map[string]mcp.Transport),
+		httpClients:    make(map[string]*http.Client),
+		rotators:       make(map[string]*credentialRotator),
+	}
+	if p.Lifecycle != nil {
+		p.Lifecycle.Append(fx.Hook{
+			OnStop: func(context.Context) error {
+				factory.stopCredentialRotation()
+				return nil
+			},
+		})
 	}
 	factory.logProxyConfig()
 	return factory, nil
+}
+
+// stopCredentialRotation stops every credential poller and closes rotated
+// generations' idle connections. Safe to call multiple times.
+func (f *ChannelTransportFactory) stopCredentialRotation() {
+	if f == nil {
+		return
+	}
+	f.rotationCancel()
+	f.mu.Lock()
+	rotators := f.rotators
+	f.rotators = make(map[string]*credentialRotator)
+	f.mu.Unlock()
+	for _, rotator := range rotators {
+		rotator.closeAll()
+	}
 }
 
 // HTTPClientForBinding returns the shared HTTP client for a binding. OAuth
@@ -88,13 +125,13 @@ func (f *ChannelTransportFactory) HTTPClientForBinding(binding runtimeconfig.MCP
 		transportKind = runtimeconfig.MCPTransportHTTPStreamable
 	}
 	if transportKind != runtimeconfig.MCPTransportHTTPStreamable {
-		return f.httpClientForKey("default", nil, "", nil, nil)
+		return f.httpClientForKey("default", nil)
 	}
 	channelName := binding.Channel.Canonical()
 	if channelName == "" {
 		return nil, fmt.Errorf("mcpclient: invalid channel name")
 	}
-	return f.httpClientForKey(channelName.String(), binding.ServerURL, binding.UnixSocketPath, binding.HTTPProxy, binding.ClientCertificate)
+	return f.httpClientForKey(channelName.String(), &binding)
 }
 
 // runtimeHTTPClientForBinding returns the HTTP client used by streamable MCP
@@ -224,7 +261,11 @@ func (f *ChannelTransportFactory) decorateTransport(base mcp.Transport) mcp.Tran
 	}
 }
 
-func (f *ChannelTransportFactory) httpClientForKey(key string, serverURL *url.URL, unixSocketPath string, proxyURL *url.URL, clientCertificate *tlsconfig.ClientCertificate) (*http.Client, error) {
+// httpClientForKey returns the cached HTTP client for one channel, building
+// the per-channel transport stack on first use. When credential rotation is
+// enabled for the binding, a generation manager is created and started; its
+// initial all-or-nothing load failing makes construction fail closed.
+func (f *ChannelTransportFactory) httpClientForKey(key string, binding *runtimeconfig.MCPChannelBinding) (*http.Client, error) {
 	f.mu.Lock()
 	if client, ok := f.httpClients[key]; ok {
 		f.mu.Unlock()
@@ -238,14 +279,65 @@ func (f *ChannelTransportFactory) httpClientForKey(key string, serverURL *url.UR
 			return client, nil
 		}
 		f.mu.Unlock()
-		transport, err := buildMcpHTTPTransport(f.logger, f.logging, f.meterProvider, f.tlsBundle, clientCertificate, unixSocketPath, proxyURL, serverURL, f.config.ExtraHeaders, f.config.DiscoveryExtraHeaders, f.config.TraceContextEnabled)
+
+		var (
+			serverURL         *url.URL
+			unixSocketPath    string
+			proxyURL          *url.URL
+			clientCertificate *tlsconfig.ClientCertificate
+		)
+		if binding != nil {
+			serverURL = binding.ServerURL
+			unixSocketPath = binding.UnixSocketPath
+			proxyURL = binding.HTTPProxy
+			clientCertificate = binding.ClientCertificate
+		}
+
+		var manager *credrotation.Manager
+		if binding != nil {
+			if spec, ok := f.config.CredentialRotationSpec(*binding); ok {
+				loader, err := credrotation.NewLoader(spec)
+				if err != nil {
+					return nil, fmt.Errorf("mcpclient: credential rotation for channel %q: %w", key, err)
+				}
+				manager, err = credrotation.NewManager(
+					f.logger.With(tclog.FieldComponent, tclog.ComponentMcpClient, "channel", key),
+					loader,
+					credrotation.WithPollInterval(f.config.CredentialRotation.PollInterval),
+				)
+				if err != nil {
+					return nil, fmt.Errorf("mcpclient: credential rotation for channel %q: %w", key, err)
+				}
+			}
+		}
+
+		transport, rotator, err := buildMcpHTTPTransport(mcpHTTPTransportParams{
+			Logger:                f.logger,
+			LoggingConfig:         f.logging,
+			MeterProvider:         f.meterProvider,
+			TLSBundle:             f.tlsBundle,
+			ClientCertificate:     clientCertificate,
+			UnixSocketPath:        unixSocketPath,
+			ProxyURL:              proxyURL,
+			ServerURL:             serverURL,
+			ExtraHeaders:          f.config.ExtraHeaders,
+			DiscoveryExtraHeaders: f.config.DiscoveryExtraHeaders,
+			LocalTracing:          f.config.TraceContextEnabled,
+			RotationManager:       manager,
+		})
 		if err != nil {
 			return nil, err
 		}
 		client := &http.Client{Transport: transport}
 		f.mu.Lock()
 		f.httpClients[key] = client
+		if rotator != nil {
+			f.rotators[key] = rotator
+		}
 		f.mu.Unlock()
+		if manager != nil {
+			go manager.Run(f.rotationCtx)
+		}
 		return client, nil
 	})
 	if err != nil {

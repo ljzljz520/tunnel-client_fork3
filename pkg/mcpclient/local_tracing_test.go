@@ -29,7 +29,13 @@ func TestLocalTracingDoesNotInjectGlobalHTTPContext(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	for _, enabled := range []bool{false, true} {
-		transport, err := buildMcpHTTPTransport(slog.New(slog.NewTextHandler(io.Discard, nil)), &runtimeconfig.LoggingConfig{}, sdkmetric.NewMeterProvider(), nil, nil, "", nil, mustParseURL(t, server.URL), nil, nil, enabled)
+		transport, _, err := buildMcpHTTPTransport(mcpHTTPTransportParams{
+			Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+			LoggingConfig: &runtimeconfig.LoggingConfig{},
+			MeterProvider: sdkmetric.NewMeterProvider(),
+			ServerURL:     mustParseURL(t, server.URL),
+			LocalTracing:  enabled,
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
